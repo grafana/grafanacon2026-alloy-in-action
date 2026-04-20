@@ -73,11 +73,11 @@ To instruct Alloy on how we want that done, we must write these instructions in 
 <img width="2504" height="1407" alt="image" src="https://github.com/user-attachments/assets/d344bd85-7d5b-4020-b063-554dcca8188f" />
 <img width="2511" height="1409" alt="image" src="https://github.com/user-attachments/assets/1ad9451c-40f0-4b4d-bd0e-e4adcd70bb9d" />
 
-The `usage` section gives you an example of how this particular component could be configured.
+The `usage` section gives you an example of how this particular component can be configured.
 
 <img width="2510" height="1409" alt="image" src="https://github.com/user-attachments/assets/346cdf21-594d-4606-ab55-01dee9470e9a" />
 
-The `arguments` and `blocks` sections list what you could do with the data. Pay close attention to the name, type, description, default, and required columns so Alloy could understand what you want it to do!
+The `arguments` and `blocks` sections list what you can do with the data. Pay close attention to the name, type, description, default, and required columns so Alloy knows what you want it to do!
 
 <img width="2508" height="1411" alt="image" src="https://github.com/user-attachments/assets/6a6102f6-82e9-4e31-bff6-faac9a5fcf6b" />
 
@@ -195,7 +195,7 @@ Copy this into your `config.alloy` file and fill in the TODOs:
 
 // Step 1: Receive OTLP traces from mission-control
 
-//The receiver listens for incoming traces. Mission-control sends traces using OTLP, so you need both gRPC and HTTP endpoints which are 4317 annd 4318 by default.
+//The receiver listens for incoming traces. Mission-control sends traces using OTLP, so you need both gRPC and HTTP endpoints which are 4317 and 4318 by default.
 otelcol.receiver.otlp "default" {
   grpc {
     endpoint = "0.0.0.0:4317"
@@ -318,7 +318,7 @@ Mission-control generates operational logs: JSON-formatted records of everything
 
 These logs are written to files inside the container but no one's reading them, just like the previous section.
 
-The environment is set up to mimic a scenario where Alloy is running on and has access to the machine's filesystem (a Daemonset in Kubernetes or simply an Alloy
+The environment is set up to mimic a scenario where Alloy runs on the host and has access to its filesystem (a DaemonSet in Kubernetes or simply an Alloy
 collector running on each VM).
 
 **Your task:**
@@ -735,7 +735,7 @@ make mission1
 An adversary discovered that our server records the full request path as a metric label. They're now flooding us with requests to thousands of random URLs, paths like `/api/a3f8c2e1` that don't map to any real endpoint. Every unique path creates a new time series in Mimir, and cardinality is climbing fast.
 
 **Your orders:**
-You'll be expanding on what you did in the Metrics foundation. There is a pre-made regular expression provided for you to use at `http://mission-control:8080/api/metrics/allowed-paths`. Use `prometheus.relabel` with a `keep` action on the `path` label to filter out the garbage. The [Alloy standard library](https://grafana.com/docs/alloy/latest/reference/stdlib/) functions may be helpful here!
+You'll be expanding on what you did in the Metrics foundation. There is a pre-made regular expression provided for you to use at `http://mission-control:8080/api/metrics/allowed-paths`. Use `prometheus.relabel` with a `keep` action on the `path` label to filter out the noise. The [Alloy standard library](https://grafana.com/docs/alloy/latest/reference/stdlib/) functions may be helpful here!
 
 <img width="2504" height="1407" alt="image" src="https://github.com/user-attachments/assets/6e3da07a-2b2f-47d8-b673-0bd6a0636860" />
 
