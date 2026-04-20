@@ -825,6 +825,46 @@ Scraped metrics should flow through your **standardize** relabel component, then
 
 </details>
 
+<details>
+<summary>Full solution</summary>
+
+```alloy
+// Fetch the allowlist (unchanged)
+remote.http "allowed_paths_regex" {
+  url = "http://mission-control:8080/api/metrics/allowed-paths"
+}
+
+// Filter: only keep series whose `path` label matches the allowlist
+prometheus.relabel "mission1" {
+  rule {
+    action        = "keep"
+    source_labels = ["path"]
+    regex         = encoding.from_json(remote.http.allowed_paths_regex.content).regex
+  }
+
+  forward_to = [prometheus.remote_write.docker_mimir.receiver]
+}
+```
+
+Make sure to rewire the existing `standardize_agent_labels` component so metrics flow through the new filter before reaching Mimir:
+
+```alloy
+prometheus.relabel "standardize_agent_labels" {
+  // ...existing rules unchanged...
+
+  forward_to = [prometheus.relabel.mission1.receiver]
+}
+```
+
+**How it works**
+
+- `remote.http.allowed_paths_regex.content` exposes the raw response body from the fetched URL, a JSON string like `{"regex":"^(/api/agents|/metrics|...)$"}`.
+- [`encoding.from_json`](https://grafana.com/docs/alloy/latest/reference/stdlib/encoding/) parses that string into an object so you can reach into it. Chaining `.regex` pulls the pre-built pattern out of the object.
+- The `keep` action tells `prometheus.relabel` to drop every series whose `path` label does not match the regex, so the attacker's random `/api/a3f8c2e1`-style paths never make it to `remote_write`.
+- The final pipeline is `scrape -> standardize_agent_labels -> mission1 -> remote_write`. Make sure `standardize_agent_labels.forward_to` points at `prometheus.relabel.mission1.receiver` so the filter sits in the path.
+
+</details>
+
 ### Verify Your Work
 
 > [!NOTE]
@@ -959,6 +999,93 @@ The stage can take a `source` (the extracted field to compare) and `value` (the 
 
 </details>
 
+<details>
+<summary>Full solution</summary>
+
+Update `loki.process.mission_control_logs` so its `forward_to` fans out to both paths:
+
+```alloy
+loki.process "mission_control_logs" {
+  // ...existing stage.json and stage.labels unchanged...
+
+  forward_to = [
+    otelcol.receiver.loki.all_logs.receiver,   // Path 1: all logs -> S3
+    loki.process.filter_debug.receiver,        // Path 2: non-DEBUG -> Loki
+  ]
+}
+```
+
+Path 1 (archive everything to S3):
+
+```alloy
+otelcol.receiver.loki "all_logs" {
+  output {
+    logs = [otelcol.processor.batch.s3_logs.input]
+  }
+}
+
+otelcol.processor.batch "s3_logs" {
+  timeout             = "10s"
+  send_batch_size     = 100
+  send_batch_max_size = 200
+
+  output {
+    logs = [otelcol.exporter.awss3.audit_logs.input]
+  }
+}
+
+otelcol.exporter.awss3 "audit_logs" {
+  s3_uploader {
+    s3_bucket = "audit-logs"
+    s3_prefix = "logs"
+
+    endpoint            = "http://localstack:4566"
+    disable_ssl         = true
+    s3_force_path_style = true
+  }
+
+  marshaler {
+    type = "body"
+  }
+
+  sending_queue {
+    batch {
+      flush_timeout = "500ms"
+      min_size      = 100
+      sizer         = "items"
+    }
+  }
+}
+```
+
+Path 2 (drop DEBUG before Loki):
+
+```alloy
+loki.process "filter_debug" {
+  stage.json {
+    expressions = {
+      level = "level",
+    }
+  }
+
+  stage.drop {
+    source = "level"
+    value  = "DEBUG"
+  }
+
+  forward_to = [loki.write.docker_loki.receiver]
+}
+```
+
+**How it works**
+
+- `forward_to` accepts a list, so listing both receivers in `loki.process.mission_control_logs` fans every log line out to both downstream paths simultaneously.
+- **Path 1 (S3 archive):** The S3 exporter is an OpenTelemetry component, so Loki-format entries have to be converted first. [`otelcol.receiver.loki`](https://grafana.com/docs/alloy/latest/reference/components/otelcol/otelcol.receiver.loki/) accepts Loki entries and emits them as OTLP logs. From there the pipeline is a standard OTel chain: `batch` holds entries up to 10s or 100 items to keep the S3 object count sane, and `awss3` writes them to the `audit-logs` bucket under a `logs/year=.../month=...` prefix. The `endpoint` override points the exporter at the local localstack container instead of real AWS.
+- **Path 2 (filtered Loki):** `stage.json` pulls the `level` field out of the JSON body and stores it in the stage's extracted map under the key `level`. `stage.drop` then references that same key: `source = "level"` tells it which extracted field to look at, and `value = "DEBUG"` is the string to compare against. Conceptually it is evaluating `extracted["level"] == "DEBUG"`, and any line that matches is dropped. Everything else (INFO, WARN, ERROR) is forwarded to `loki.write.docker_loki`, the same Loki sink you wired up in the Logs foundation.
+- The result is a tiered storage pattern: all logs are archived cheaply in S3 for compliance and post-incident forensics, and only the higher-signal levels are indexed in Loki for interactive querying.
+
+</details>
+
 ### Verify Your Work
 
 ```bash
@@ -1021,6 +1148,42 @@ otelcol.processor.probabilistic_sampler "mission3" {
 <summary>Hint: wiring</summary>
 
 OTLP components use `.input` to receive data, just like you wired the batch processor in the foundations.
+
+</details>
+
+<details>
+<summary>Full solution</summary>
+
+Update the existing `otelcol.receiver.otlp "default"` so traces flow into the sampler before the batch processor:
+
+```alloy
+otelcol.receiver.otlp "default" {
+  // ...grpc and http blocks unchanged...
+
+  output {
+    traces = [otelcol.processor.probabilistic_sampler.mission3.input]
+  }
+}
+```
+
+Add the sampler itself, forwarding survivors to the existing batch processor:
+
+```alloy
+otelcol.processor.probabilistic_sampler "mission3" {
+  sampling_percentage = 5.0
+
+  output {
+    traces = [otelcol.processor.batch.default.input]
+  }
+}
+```
+
+**How it works**
+
+- The sampler makes a keep-or-drop decision the instant a trace enters the collector. By default, that decision is derived from a hash of the trace ID, so it is deterministic: any collector that sees spans from the same trace will arrive at the same verdict, and traces stay intact rather than getting partially exported.
+- `sampling_percentage = 5.0` keeps roughly 1 in every 20 traces. The other 95% are dropped immediately and never reach the batch processor, which is why volume to Tempo falls off sharply after reload.
+- Trade-off: head sampling is cheap and stateless, but it is blind to what happens inside the trace. A trace that contains a 500 error has the same 5% survival odds as a healthy trace, which is what the "needle-in-a-haystack" warning is pointing at. Mission IV addresses this by swapping to tail sampling, where the decision can be based on the trace's contents.
+- Make sure `otelcol.receiver.otlp.default.output.traces` points at `otelcol.processor.probabilistic_sampler.mission3.input`. If it still points straight at the batch processor, the sampler is bypassed entirely.
 
 </details>
 
@@ -1122,6 +1285,72 @@ policy {
 <summary>Hint 3: error status codes</summary>
 
 The [`status_code` block](https://grafana.com/docs/alloy/latest/reference/components/otelcol/otelcol.processor.tail_sampling/#status_code) lists the valid values for `status_codes`.
+
+</details>
+
+<details>
+<summary>Full solution</summary>
+
+Update the existing `otelcol.receiver.otlp "default"` so traces flow into the tail sampler instead of the head sampler from Mission III:
+
+```alloy
+otelcol.receiver.otlp "default" {
+  // ...grpc and http blocks unchanged...
+
+  output {
+    traces = [otelcol.processor.tail_sampling.mission4.input]
+  }
+}
+```
+
+Add the tail sampler with both policies, forwarding kept traces to the existing batch processor:
+
+```alloy
+otelcol.processor.tail_sampling "mission4" {
+  decision_wait = "10s"
+
+  policy {
+    name = "keep_all_errors"
+    type = "status_code"
+
+    status_code {
+      status_codes = ["ERROR"]
+    }
+  }
+
+  policy {
+    name = "sample_normal_traffic"
+    type = "probabilistic"
+
+    probabilistic {
+      sampling_percentage = 5.0
+    }
+  }
+
+  output {
+    traces = [otelcol.processor.batch.default.input]
+  }
+}
+```
+
+**How it works**
+
+- Tail sampling buffers every span of a trace in memory as it arrives. The decision about whether to keep or drop the trace is deferred until either the root span is received or `decision_wait` (10s here) elapses, whichever comes first. That delay is what lets the sampler see the full picture (status codes, attributes, latency) before committing.
+- Policies are evaluated with OR logic: if **any** policy votes to sample, the whole trace is kept. That's why the two policies in this config compose naturally:
+  - `type = "status_code"` with `status_codes = ["ERROR"]` retains every trace that contains at least one error span. Each dead-drop fragment the field agent is leaking rides on an error span, so this policy guarantees every fragment survives.
+  - `type = "probabilistic"` with `sampling_percentage = 5.0` keeps 5% of healthy traffic, preserving a baseline for general observability.
+- Swapping head sampling for tail sampling is exactly what unlocks the mission: under head sampling, error traces had the same 5% survival odds as anything else, so most fragments were dropped before anyone could read them. Under tail sampling, the `status_code` policy makes error traces deterministic keepers.
+- Make sure `otelcol.receiver.otlp.default.output.traces` points at `otelcol.processor.tail_sampling.mission4.input`, and remove or rewire around the `probabilistic_sampler` from Mission III so traces do not flow through both.
+
+> [!IMPORTANT]
+> **Tail sampling is more involved to operate than head sampling.** The workshop runs a single Alloy instance so this is handled for you, but in a real deployment there are two operational constraints to plan for:
+>
+> 1. **Memory:** every span is buffered until `decision_wait` expires or the root span arrives, so the collector needs enough memory to hold `decision_wait` worth of in-flight traces.
+> 2. **Trace locality:** all spans belonging to the same trace must reach the same Alloy instance, otherwise the sampler only sees part of the trace and cannot make an informed decision. Two common ways to guarantee this:
+>    - A load balancer in front of Alloy that does consistent hashing on the trace ID, so every span for a given trace lands on the same instance.
+>    - The [`otelcol.exporter.loadbalancing`](https://grafana.com/docs/alloy/latest/reference/components/otelcol/otelcol.exporter.loadbalancing/) component, which routes spans to downstream Alloy instances by trace ID.
+>
+> For a fuller walkthrough of both sampling strategies and how to lay them out in a real deployment, see [Sampling with the OpenTelemetry Collector](https://grafana.com/docs/opentelemetry/collector/sampling/).
 
 </details>
 

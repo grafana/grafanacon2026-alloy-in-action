@@ -1,0 +1,339 @@
+livedebugging {
+  enabled = true
+}
+
+/*
+  Full solution: Foundations 1-3 + Missions I-IV
+
+  This file shows the final state of config.alloy after completing the
+  three foundations and all four missions. Mission III (head sampling)
+  is included as a commented reference because Mission IV (tail sampling)
+  replaces it in the trace pipeline.
+
+  To use this file directly:
+    cp alloy/solution.alloy alloy/config.alloy
+    make alloy-reload
+*/
+
+// ============================================================================
+// TRACES (Foundation I + Mission IV tail sampling)
+// ============================================================================
+//
+//  Mission Control
+//        │ OTLP (gRPC :4317, HTTP :4318)
+//        ▼
+//  ┌───────────────────────┐   ┌─────────────────────────────────┐   ┌─────────────────────────┐   ┌───────────────────────────┐
+//  │ otelcol.receiver.otlp │──▶│ otelcol.processor.tail_sampling │──▶│ otelcol.processor.batch │──▶│ otelcol.exporter.otlphttp │──▶ Tempo
+//  └───────────────────────┘   └─────────────────────────────────┘   └─────────────────────────┘   └───────────────────────────┘
+//    Receive OTLP spans           Keep errors + 5% of healthy           Batch for efficiency            Push spans to Tempo
+
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    traces = [otelcol.processor.tail_sampling.mission4.input]
+  }
+}
+
+/*
+  Mission IV: Leave No (Error) Trace
+
+  Buffers every span of a trace in memory until the root span arrives or
+  decision_wait expires, whichever comes first. Then evaluates the policies
+  below using OR logic: if any policy votes to sample, the whole trace is kept.
+
+    - status_code policy keeps every trace containing at least one ERROR span
+    - probabilistic policy keeps 5% of everything else for baseline coverage
+*/
+otelcol.processor.tail_sampling "mission4" {
+  decision_wait = "10s"
+
+  policy {
+    name = "keep_all_errors"
+    type = "status_code"
+
+    status_code {
+      status_codes = ["ERROR"]
+    }
+  }
+
+  policy {
+    name = "sample_normal_traffic"
+    type = "probabilistic"
+
+    probabilistic {
+      sampling_percentage = 5.0
+    }
+  }
+
+  output {
+    traces = [otelcol.processor.batch.default.input]
+  }
+}
+
+/*
+  Mission III: Selective Surveillance (head sampling), replaced by Mission IV.
+
+  Included for reference. To switch back to head sampling:
+    1. Remove (or comment out) otelcol.processor.tail_sampling.mission4 above.
+    2. Uncomment the block below.
+    3. Change otelcol.receiver.otlp.default.output.traces to
+       [otelcol.processor.probabilistic_sampler.mission3.input].
+
+  otelcol.processor.probabilistic_sampler "mission3" {
+    sampling_percentage = 5.0
+
+    output {
+      traces = [otelcol.processor.batch.default.input]
+    }
+  }
+*/
+
+// Batches spans for efficient export to Tempo.
+otelcol.processor.batch "default" {
+  send_batch_size     = 100
+  send_batch_max_size = 200
+  timeout             = "250ms"
+
+  output {
+    traces = [otelcol.exporter.otlphttp.docker_tempo.input]
+  }
+}
+
+// ============================================================================
+// LOGS (Foundation II + Mission II fan-out to S3 and filtered Loki)
+// ============================================================================
+//
+//  /var/log/alloy/*.log
+//        │
+//        ▼
+//  ┌──────────────────────┐   ┌───────────────────────────────────┐
+//  │   loki.source.file   │──▶│ loki.process.mission_control_logs │──┬──▶ Path 1: all logs -> S3
+//  └──────────────────────┘   └───────────────────────────────────┘  │
+//                                                                     └──▶ Path 2: non-DEBUG -> Loki
+
+// Discovers and tails matched log files.
+loki.source.file "mission_control" {
+  targets    = [{"__path__" = "/var/log/alloy/*.log"}]
+
+  file_match {
+    enabled = true
+  }
+
+  forward_to = [loki.process.mission_control_logs.receiver]
+}
+
+/*
+  Parses JSON logs and promotes `component` to an indexed Loki label
+  (Foundation II), then fans every log line out to both downstream
+  paths (Mission II) by listing two receivers in forward_to.
+*/
+loki.process "mission_control_logs" {
+  stage.json {
+    expressions = {
+      component = "component",
+    }
+  }
+
+  stage.labels {
+    values = {
+      component = "",
+    }
+  }
+
+  forward_to = [
+    otelcol.receiver.loki.all_logs.receiver,   // Path 1: all logs -> S3
+    loki.process.filter_debug.receiver,         // Path 2: non-DEBUG -> Loki
+  ]
+}
+
+// ---- Path 1: Operation Cold Storage (archive all logs to S3) ---------------
+//
+//  loki.process -> otelcol.receiver.loki -> otelcol.processor.batch -> otelcol.exporter.awss3 -> localstack
+
+/*
+  Bridges Loki entries into the OpenTelemetry pipeline so they can reach
+  otelcol.exporter.awss3 (an OTel-only component with no native Loki sibling).
+*/
+otelcol.receiver.loki "all_logs" {
+  output {
+    logs = [otelcol.processor.batch.s3_logs.input]
+  }
+}
+
+otelcol.processor.batch "s3_logs" {
+  timeout             = "10s"
+  send_batch_size     = 100
+  send_batch_max_size = 200
+
+  output {
+    logs = [otelcol.exporter.awss3.audit_logs.input]
+  }
+}
+
+/*
+  Writes objects to the `audit-logs` bucket under a logs/year=.../month=...
+  prefix. The endpoint override points at the local localstack container
+  instead of real AWS, so no credentials are required.
+*/
+otelcol.exporter.awss3 "audit_logs" {
+  s3_uploader {
+    s3_bucket = "audit-logs"
+    s3_prefix = "logs"
+
+    endpoint            = "http://localstack:4566"
+    disable_ssl         = true
+    s3_force_path_style = true
+  }
+
+  marshaler {
+    type = "body"
+  }
+
+  sending_queue {
+    batch {
+      flush_timeout = "500ms"
+      min_size      = 100
+      sizer         = "items"
+    }
+  }
+}
+
+// ---- Path 2: filter DEBUG out before Loki ----------------------------------
+/*
+  stage.json extracts the `level` field out of the JSON body into the stage's
+  extracted map. stage.drop then references the same key: source = "level"
+  picks which extracted field to look at, value = "DEBUG" is the string to
+  match. Conceptually it evaluates extracted["level"] == "DEBUG" and discards
+  matching lines, so only INFO / WARN / ERROR reach Loki.
+*/
+loki.process "filter_debug" {
+  stage.json {
+    expressions = {
+      level = "level",
+    }
+  }
+
+  stage.drop {
+    source = "level"
+    value  = "DEBUG"
+  }
+
+  forward_to = [loki.write.docker_loki.receiver]
+}
+
+// ============================================================================
+// METRICS (Foundation III + Mission I cardinality filter)
+// ============================================================================
+//
+//  Mission Control
+//        │
+//        ▼
+//  ┌───────────────────┐   ┌───────────────────────────────────┐   ┌────────────────────┐   ┌─────────────────────────┐
+//  │ prometheus.scrape │──▶│ prometheus.relabel.standardize... │──▶│ prometheus.relabel │──▶│ prometheus.remote_write │──▶ Mimir
+//  │                   │   │          (foundation)             │   │      .mission1     │   │                         │
+//  └───────────────────┘   └───────────────────────────────────┘   └────────────────────┘   └─────────────────────────┘
+//    Scrape /metrics          Standardize label names              Keep only allowed paths      Push to Mimir
+
+prometheus.scrape "mission_control" {
+  scrape_interval = "5s"
+  scrape_timeout  = "4s"
+
+  targets    = [{"__address__" = "mission-control:8080"}]
+  forward_to = [prometheus.relabel.standardize_agent_labels.receiver]
+}
+
+/*
+  Standardizes labels (id -> agent_id, region -> country_code) and then
+  forwards to the Mission I cardinality filter instead of going directly
+  to remote_write. regex = "(.+)" matches only when the source label is
+  present and non-empty, so the rules are safe no-ops for metrics that
+  already use the canonical names.
+*/
+prometheus.relabel "standardize_agent_labels" {
+  rule {
+    action        = "replace"
+    source_labels = ["id"]
+    regex         = "(.+)"
+    target_label  = "agent_id"
+  }
+
+  rule {
+    action = "labeldrop"
+    regex  = "^id$"
+  }
+
+  rule {
+    action        = "replace"
+    source_labels = ["region"]
+    regex         = "(.+)"
+    target_label  = "country_code"
+  }
+
+  rule {
+    action = "labeldrop"
+    regex  = "^region$"
+  }
+
+  forward_to = [prometheus.relabel.mission1.receiver]
+}
+
+/*
+  Mission I: Rogue Dimension
+
+  remote.http fetches a pre-built regex of legitimate paths. The response
+  body is JSON like {"regex":"^(/api/agents|/metrics|...)$"}, so
+  encoding.from_json parses it and .regex plucks the pattern out.
+
+  The `keep` action drops every series whose `path` label does not match,
+  which filters out the attacker's random /api/a3f8c2e1-style paths before
+  they reach Mimir.
+*/
+remote.http "allowed_paths_regex" {
+  url = "http://mission-control:8080/api/metrics/allowed-paths"
+}
+
+prometheus.relabel "mission1" {
+  rule {
+    action        = "keep"
+    source_labels = ["path"]
+    regex         = encoding.from_json(remote.http.allowed_paths_regex.content).regex
+  }
+
+  forward_to = [prometheus.remote_write.docker_mimir.receiver]
+}
+
+// ============================================================================
+// DESTINATIONS
+// ============================================================================
+
+// Pushes spans to Tempo.
+otelcol.exporter.otlphttp "docker_tempo" {
+  client {
+    endpoint = "http://tempo:4318"
+    tls {
+      insecure             = true  // plain HTTP, fine for local dev
+      insecure_skip_verify = true
+    }
+  }
+}
+
+// Pushes metrics to Mimir.
+prometheus.remote_write "docker_mimir" {
+  endpoint {
+    url = "http://mimir:9009/api/v1/push"
+  }
+}
+
+// Pushes logs to Loki.
+loki.write "docker_loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
