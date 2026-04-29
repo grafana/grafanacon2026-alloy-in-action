@@ -111,7 +111,7 @@ services:
     restart: unless-stopped
 
   localstack-init:
-    image: curlimages/curl:latest@sha256:d94d07ba9e7d6de898b6d96c1a072f6f8266c687af78a74f380087a0addf5d17
+    image: curlimages/curl:latest@sha256:b3f1fb2a51d923260350d21b8654bbc607164a987e2f7c84a0ac199a67df812a
     depends_on:
       - localstack
     entrypoint: /bin/sh
