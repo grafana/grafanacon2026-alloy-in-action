@@ -25,7 +25,7 @@ services:
       - alloy
 
   alloy:
-    image: grafana/alloy:v1.15.0@sha256:579582bce40049f2e27bd1e445000689c907a41f0495cb0d0c7f65609316ba7c
+    image: grafana/alloy:v1.20.1@sha256:2aa2099af76c0098d4af7a4d6e48f86cb66dc1a000222ad927a1c67c6542d13f
     ports:
       - "12347:12345"  # Alloy UI
       - "4317:4317"    # OTLP gRPC receiver
