@@ -88,7 +88,7 @@ services:
     restart: unless-stopped
 
   mimir:
-    image: grafana/mimir:3.0.2@sha256:4231caf9be780e5d9113449e57a0258d388124aca74c0a14b9cf8857e23aad76
+    image: grafana/mimir:3.2.2@sha256:04068a0a838b6efe9449a04c1d6acd74c7438ac6073dfcbb99c29892647525e3
     ports:
       - "9009:9009"
     volumes:
